@@ -1,7 +1,12 @@
 import type { Plugin, PluginInput } from '@opencode-ai/plugin'
 import fs from 'node:fs'
 import { syncAuthFromOpenCode } from './auth-sync.js'
-import { createAuthorizationFlow, loginAccount } from './auth.js'
+import {
+  completeAuthorizationFlow,
+  createAuthorizationFlow,
+  loginAccount,
+  promptForCallbackUrl
+} from './auth.js'
 import {
   extractRateLimitUpdate,
   getBlockingRateLimitResetAt,
@@ -274,7 +279,7 @@ const MultiAuthPlugin: Plugin = async ({ client, $, serverUrl, project, director
   const escapeAppleScriptString = (value: string): string => {
     return String(value)
       .replaceAll('\\', '\\\\')
-      .replaceAll('"', '\"')
+      .replaceAll('"', '\\"')
       .replaceAll(String.fromCharCode(10), '\n')
   }
 
@@ -541,41 +546,41 @@ const MultiAuthPlugin: Plugin = async ({ client, $, serverUrl, project, director
 
         lastStatusBySession.set(sessionID, 'idle')
       }
-	    },
-	    config: async (config) => {
-	      const injectModelsRaw = process.env.OPENCODE_MULTI_AUTH_INJECT_MODELS
-	      const injectModels = injectModelsRaw !== '0' && injectModelsRaw !== 'false'
-	      if (!injectModels) return
+    },
+    config: async (config) => {
+      const injectModelsRaw = process.env.OPENCODE_MULTI_AUTH_INJECT_MODELS
+      const injectModels = injectModelsRaw !== '0' && injectModelsRaw !== 'false'
+      if (!injectModels) return
 
-	      const latestModel = (process.env.OPENCODE_MULTI_AUTH_CODEX_LATEST_MODEL || 'gpt-5.4').trim()
-	      try {
-	        const openai = (config.provider?.[PROVIDER_ID] as any) || null
-	        if (!openai || typeof openai !== 'object') return
-	        openai.models ||= {}
-          openai.whitelist ||= []
+      const latestModel = (process.env.OPENCODE_MULTI_AUTH_CODEX_LATEST_MODEL || 'gpt-5.4').trim()
+      try {
+        const openai = (config.provider?.[PROVIDER_ID] as any) || null
+        if (!openai || typeof openai !== 'object') return
+        openai.models ||= {}
+        openai.whitelist ||= []
 
-          const defaultModels = getDefaultModels()
-          const injectedModelIds = [latestModel]
-          if (latestModel === 'gpt-5.4' && defaultModels['gpt-5.4-fast']) {
-            injectedModelIds.push('gpt-5.4-fast')
+        const defaultModels = getDefaultModels()
+        const injectedModelIds = [latestModel]
+        if (latestModel === 'gpt-5.4' && defaultModels['gpt-5.4-fast']) {
+          injectedModelIds.push('gpt-5.4-fast')
+        }
+
+        for (const modelID of injectedModelIds) {
+          const model = defaultModels[modelID]
+          if (!model || openai.models[modelID]) continue
+          openai.models[modelID] = model
+        }
+
+        for (const modelID of injectedModelIds) {
+          if (!openai.whitelist.includes(modelID)) {
+            openai.whitelist.unshift(modelID)
           }
+        }
 
-	        for (const modelID of injectedModelIds) {
-            const model = defaultModels[modelID]
-	          if (!model || openai.models[modelID]) continue
-	          openai.models[modelID] = model
-	        }
-
-          for (const modelID of injectedModelIds) {
-            if (!openai.whitelist.includes(modelID)) {
-              openai.whitelist.unshift(modelID)
-            }
-          }
-
-	        if (process.env.OPENCODE_MULTI_AUTH_DEBUG === '1') {
-	          console.log(`[multi-auth] injected runtime models: ${injectedModelIds.join(', ')}`)
-	        }
-	      } catch (err) {
+        if (process.env.OPENCODE_MULTI_AUTH_DEBUG === '1') {
+          console.log(`[multi-auth] injected runtime models: ${injectedModelIds.join(', ')}`)
+        }
+      } catch (err) {
         if (process.env.OPENCODE_MULTI_AUTH_DEBUG === '1') {
           console.log('[multi-auth] config injection failed:', err)
         }
@@ -945,6 +950,47 @@ const MultiAuthPlugin: Plugin = async ({ client, $, serverUrl, project, director
               callback: async () => {
                 try {
                   const account = await loginAccount(alias, flow)
+                  return {
+                    type: 'success' as const,
+                    provider: PROVIDER_ID,
+                    refresh: account.refreshToken,
+                    access: account.accessToken,
+                    expires: account.expiresAt
+                  }
+                } catch {
+                  return { type: 'failed' as const }
+                }
+              }
+            }
+          }
+        },
+        {
+          label: 'ChatGPT OAuth (Manual Callback)',
+          type: 'oauth' as const,
+
+          prompts: [
+            {
+              type: 'text' as const,
+              key: 'alias',
+              message: 'Account alias (e.g., personal, work)',
+              placeholder: 'personal'
+            }
+          ],
+
+          authorize: async (inputs?: Record<string, string>) => {
+            const alias = inputs?.alias || `account-${Date.now()}`
+            const flow = await createAuthorizationFlow()
+
+            return {
+              url: flow.url,
+              method: 'auto' as const,
+              instructions:
+                `If this OpenCode session is remote, complete login in your browser, then paste the full callback URL back into the terminal prompt for "${alias}".`,
+
+              callback: async () => {
+                try {
+                  const callbackUrl = await promptForCallbackUrl(alias, flow)
+                  const account = await completeAuthorizationFlow(alias, flow, callbackUrl)
                   return {
                     type: 'success' as const,
                     provider: PROVIDER_ID,
