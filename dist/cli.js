@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { fileURLToPath } from 'node:url';
-import { loginAccount } from './auth.js';
+import { completeAuthorizationFlow, createAuthorizationFlow, loginAccount, loginAccountHeadless } from './auth.js';
 import { removeAccount, listAccounts, getStorePath, loadStore } from './store.js';
 import { startWebConsole } from './web.js';
 import { disableService, installService, serviceStatus } from './systemd.js';
@@ -13,6 +13,9 @@ function getFlagValue(flag) {
         return undefined;
     return args[idx + 1];
 }
+function hasFlag(flag) {
+    return args.includes(flag);
+}
 async function main() {
     switch (command) {
         case 'add':
@@ -23,12 +26,36 @@ async function main() {
                 process.exit(1);
             }
             try {
-                const account = await loginAccount(alias);
+                const account = hasFlag('--headless')
+                    ? await loginAccountHeadless(alias)
+                    : await loginAccount(alias);
                 console.log(`\nAccount "${alias}" added successfully!`);
                 console.log(`Email: ${account.email || 'unknown'}`);
             }
             catch (err) {
                 console.error(`Failed to add account: ${err}`);
+                process.exit(1);
+            }
+            break;
+        }
+        case 'complete': {
+            if (!alias) {
+                console.error('Usage: opencode-multi-auth complete <alias> <callback_url>');
+                process.exit(1);
+            }
+            const callbackUrl = args[2] || getFlagValue('--callback-url');
+            if (!callbackUrl) {
+                console.error('Usage: opencode-multi-auth complete <alias> <callback_url>');
+                process.exit(1);
+            }
+            try {
+                const flow = await createAuthorizationFlow();
+                const account = await completeAuthorizationFlow(alias, flow, callbackUrl);
+                console.log(`\nAccount "${alias}" added successfully!`);
+                console.log(`Email: ${account.email || 'unknown'}`);
+            }
+            catch (err) {
+                console.error(`Failed to complete account login: ${err}`);
                 process.exit(1);
             }
             break;
@@ -130,7 +157,11 @@ async function main() {
 opencode-multi-auth - Multi-account OAuth rotation for OpenAI Codex
 
 Commands:
-  add <alias>      Add a new account (opens browser for OAuth)
+  add <alias>      Add a new account (browser callback flow)
+  add <alias> --headless
+                    Add a new account using manual callback completion
+  complete <alias> <callback_url>
+                    Finish a manual callback flow with a pasted callback URL
   remove <alias>   Remove an account
   list             List all configured accounts
   status           Show detailed account status
@@ -141,8 +172,10 @@ Commands:
 
 Examples:
   opencode-multi-auth add personal
+  opencode-multi-auth add personal --headless
   opencode-multi-auth add work
   opencode-multi-auth add backup
+  opencode-multi-auth complete personal 'http://localhost:1455/auth/callback?code=...&state=...'
   opencode-multi-auth status
   opencode-multi-auth web --port 3434 --host 127.0.0.1
   opencode-multi-auth service install --port 3434 --host 127.0.0.1

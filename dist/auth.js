@@ -1,6 +1,8 @@
 import { generatePKCE } from '@openauthjs/openauth/pkce';
 import { randomBytes } from 'node:crypto';
 import * as http from 'http';
+import * as readline from 'node:readline/promises';
+import process from 'node:process';
 import * as url from 'url';
 import { addAccount, updateAccount, loadStore } from './store.js';
 import { clearAuthInvalid } from './rotation.js';
@@ -61,11 +63,125 @@ async function findAvailablePort(server, ports) {
     }
     throw new Error(`All ports ${ports.join(', ')} are in use. Stop Codex CLI if running.`);
 }
+async function exchangeAuthorizationCode(flow, code) {
+    const tokenRes = await fetch(TOKEN_URL, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({
+            grant_type: 'authorization_code',
+            client_id: CLIENT_ID,
+            code,
+            code_verifier: flow.pkce.verifier,
+            redirect_uri: flow.redirectUri
+        })
+    });
+    if (!tokenRes.ok) {
+        throw new Error(`Token exchange failed: ${tokenRes.status}`);
+    }
+    const tokens = (await tokenRes.json());
+    if (!tokens.refresh_token) {
+        throw new Error('Token exchange did not return a refresh_token');
+    }
+    return {
+        ...tokens,
+        refresh_token: tokens.refresh_token
+    };
+}
+async function persistAuthenticatedAccount(alias, tokens) {
+    const now = Date.now();
+    const accessClaims = decodeJwtPayload(tokens.access_token);
+    const idClaims = tokens.id_token ? decodeJwtPayload(tokens.id_token) : null;
+    const expiresAt = getExpiryFromClaims(accessClaims) ||
+        getExpiryFromClaims(idClaims) ||
+        now + tokens.expires_in * 1000;
+    let email = getEmailFromClaims(idClaims) || getEmailFromClaims(accessClaims);
+    try {
+        const userRes = await fetch(`${OPENAI_ISSUER}/userinfo`, {
+            headers: { Authorization: `Bearer ${tokens.access_token}` }
+        });
+        if (userRes.ok) {
+            const user = (await userRes.json());
+            email = user.email || email;
+        }
+    }
+    catch {
+    }
+    const accountId = getAccountIdFromClaims(idClaims) ||
+        getAccountIdFromClaims(accessClaims);
+    const store = addAccount(alias, {
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token,
+        idToken: tokens.id_token,
+        accountId,
+        expiresAt,
+        email,
+        lastRefresh: new Date(now).toISOString(),
+        lastSeenAt: now,
+        source: 'opencode',
+        authInvalid: false,
+        authInvalidatedAt: undefined
+    });
+    return store.accounts[alias];
+}
+export function parseAuthorizationCallbackUrl(callbackUrl, expectedState) {
+    let parsed;
+    try {
+        parsed = new URL(callbackUrl.trim());
+    }
+    catch {
+        throw new Error('Invalid callback URL');
+    }
+    const code = parsed.searchParams.get('code');
+    const returnedState = parsed.searchParams.get('state');
+    const authError = parsed.searchParams.get('error');
+    const authErrorDescription = parsed.searchParams.get('error_description');
+    if (authError) {
+        throw new Error(`Authorization failed: ${authErrorDescription || authError}`);
+    }
+    if (!code) {
+        throw new Error('Invalid callback URL: missing authorization code');
+    }
+    if (expectedState && returnedState && returnedState !== expectedState) {
+        throw new Error('Invalid state');
+    }
+    return code;
+}
+export async function completeAuthorizationFlow(alias, flow, callbackUrl) {
+    const code = parseAuthorizationCallbackUrl(callbackUrl, flow.state);
+    const tokens = await exchangeAuthorizationCode(flow, code);
+    return persistAuthenticatedAccount(alias, tokens);
+}
+export async function promptForCallbackUrl(alias, flow) {
+    console.log(`\n[multi-auth] Headless login for account "${alias}"`);
+    console.log('[multi-auth] Open this URL in your browser:\n');
+    console.log(`  ${flow.url}\n`);
+    console.log('[multi-auth] After OpenAI redirects, the page may fail to load on your local machine if this session is remote.');
+    console.log('[multi-auth] Copy the FULL callback URL from the browser address bar and paste it below.\n');
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+    try {
+        while (true) {
+            const callbackUrl = (await rl.question('Callback URL: ')).trim();
+            if (!callbackUrl) {
+                console.log('[multi-auth] Callback URL cannot be empty.');
+                continue;
+            }
+            return callbackUrl;
+        }
+    }
+    finally {
+        rl.close();
+    }
+}
+export async function loginAccountHeadless(alias, flow) {
+    const activeFlow = flow || await createAuthorizationFlow();
+    const callbackUrl = await promptForCallbackUrl(alias, activeFlow);
+    return completeAuthorizationFlow(alias, activeFlow, callbackUrl);
+}
 export async function loginAccount(alias, flow, options) {
     const ports = DEFAULT_REDIRECT_PORTS;
     let activeFlow = flow;
     let server = null;
-    const timeoutMs = Math.max(30_000, options?.timeoutMs ?? 5 * 60 * 1000);
+    const timeoutMs = Math.max(30000, options?.timeoutMs ?? 5 * 60 * 1000);
     return new Promise(async (resolve, reject) => {
         let finished = false;
         let timeout = null;
@@ -114,63 +230,14 @@ export async function loginAccount(alias, flow, options) {
                 return;
             }
             try {
-                const tokenRes = await fetch(TOKEN_URL, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: new URLSearchParams({
-                        grant_type: 'authorization_code',
-                        client_id: CLIENT_ID,
-                        code,
-                        code_verifier: activeFlow.pkce.verifier,
-                        redirect_uri: activeFlow.redirectUri
-                    })
-                });
-                if (!tokenRes.ok) {
-                    throw new Error(`Token exchange failed: ${tokenRes.status}`);
-                }
-                const tokens = (await tokenRes.json());
-                if (!tokens.refresh_token) {
-                    throw new Error('Token exchange did not return a refresh_token');
-                }
-                const now = Date.now();
-                const accessClaims = decodeJwtPayload(tokens.access_token);
-                const idClaims = tokens.id_token ? decodeJwtPayload(tokens.id_token) : null;
-                const expiresAt = getExpiryFromClaims(accessClaims) || getExpiryFromClaims(idClaims) || now + tokens.expires_in * 1000;
-                let email = getEmailFromClaims(idClaims) || getEmailFromClaims(accessClaims);
-                try {
-                    const userRes = await fetch(`${OPENAI_ISSUER}/userinfo`, {
-                        headers: { Authorization: `Bearer ${tokens.access_token}` }
-                    });
-                    if (userRes.ok) {
-                        const user = (await userRes.json());
-                        email = user.email || email;
-                    }
-                }
-                catch {
-                    /* user info fetch is non-critical */
-                }
-                const accountId = getAccountIdFromClaims(idClaims) ||
-                    getAccountIdFromClaims(accessClaims);
-                const store = addAccount(alias, {
-                    accessToken: tokens.access_token,
-                    refreshToken: tokens.refresh_token,
-                    idToken: tokens.id_token,
-                    accountId,
-                    expiresAt,
-                    email,
-                    lastRefresh: new Date(now).toISOString(),
-                    lastSeenAt: now,
-                    source: 'opencode',
-                    authInvalid: false,
-                    authInvalidatedAt: undefined
-                });
-                const account = store.accounts[alias];
+                const callbackUrl = new URL(req.url, activeFlow.redirectUri).toString();
+                const account = await completeAuthorizationFlow(alias, activeFlow, callbackUrl);
                 res.writeHead(200, { 'Content-Type': 'text/html' });
                 res.end(`
           <html>
             <body style="font-family: system-ui; padding: 40px; text-align: center;">
               <h1>Account "${alias}" authenticated!</h1>
-              <p>${email || 'Unknown email'}</p>
+              <p>${account.email || 'Unknown email'}</p>
               <p>You can close this window.</p>
             </body>
           </html>
@@ -229,7 +296,6 @@ export async function refreshToken(alias) {
                     });
                 }
                 catch {
-                    // ignore
                 }
             }
             return null;
