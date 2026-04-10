@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import { syncAuthFromOpenCode } from './auth-sync.js';
-import { completeAuthorizationFlow, createAuthorizationFlow, loginAccount, promptForCallbackUrl } from './auth.js';
+import { createAuthorizationFlow, loginAccount } from './auth.js';
 import { extractRateLimitUpdate, getBlockingRateLimitResetAt, mergeRateLimits, parseRateLimitResetFromError, parseRetryAfterHeader } from './rate-limits.js';
 import { getNextAccount, markAuthInvalid, markModelUnsupported, markRateLimited, markWorkspaceDeactivated } from './rotation.js';
 import { getDefaultModels } from './models.js';
@@ -57,11 +57,15 @@ function rewriteUrlForCodex(url) {
     return url.replace(URL_PATHS.RESPONSES, URL_PATHS.CODEX_RESPONSES);
 }
 function extractPathAndSearch(url) {
+    // OpenCode sometimes passes relative paths (e.g. "/chat/completions") or even
+    // malformed strings when provider base_url is missing (e.g. "undefined/...").
+    // We only need the path+query and then we force the ChatGPT backend base URL.
     try {
         const u = new URL(url);
         return `${u.pathname}${u.search}`;
     }
     catch {
+        // best-effort fallback
     }
     const trimmed = String(url || '').trim();
     if (trimmed.startsWith('/'))
@@ -73,6 +77,7 @@ function extractPathAndSearch(url) {
 }
 function toCodexBackendUrl(originalUrl) {
     const pathAndSearch = extractPathAndSearch(originalUrl);
+    // Map OpenAI v1 endpoints to ChatGPT Codex endpoints.
     let mapped = pathAndSearch;
     if (mapped.includes(URL_PATHS.RESPONSES)) {
         mapped = mapped.replace(URL_PATHS.RESPONSES, URL_PATHS.CODEX_RESPONSES);
@@ -100,6 +105,10 @@ function normalizeModel(model) {
         return 'gpt-5.1';
     const modelId = model.includes('/') ? model.split('/').pop() : model;
     const baseModel = modelId.replace(/-(?:fast|none|minimal|low|medium|high|xhigh)$/, '');
+    // OpenCode may lag behind the latest ChatGPT Codex model allowlist. Route known
+    // older Codex selections to the latest backend model when enabled.
+    // Codex model on the ChatGPT backend for users who want the newest model without
+    // waiting for upstream registry updates.
     const preferLatestRaw = process.env.OPENCODE_MULTI_AUTH_PREFER_CODEX_LATEST;
     const preferLatest = preferLatestRaw === '1' || preferLatestRaw === 'true';
     if (preferLatest &&
@@ -155,6 +164,7 @@ function parseSseStream(sseText) {
             }
         }
         catch {
+            // ignore malformed chunks
         }
     }
     return null;
@@ -188,8 +198,305 @@ async function convertSseToJson(response, headers) {
         headers: jsonHeaders
     });
 }
+/**
+ * Multi-account OAuth plugin for OpenCode
+ *
+ * Rotates between multiple ChatGPT Plus/Pro accounts for rate limit resilience.
+ */
 const MultiAuthPlugin = async ({ client, $, serverUrl, project, directory }) => {
+    const terminalNotifierPath = (() => {
+        const candidates = [
+            '/opt/homebrew/bin/terminal-notifier',
+            '/usr/local/bin/terminal-notifier'
+        ];
+        for (const c of candidates) {
+            try {
+                if (fs.existsSync(c))
+                    return c;
+            }
+            catch {
+                // ignore
+            }
+        }
+        return null;
+    })();
+    const notifyEnabledRaw = process.env.OPENCODE_MULTI_AUTH_NOTIFY;
+    const notifyEnabled = notifyEnabledRaw !== '0' && notifyEnabledRaw !== 'false';
+    const notifySound = (process.env.OPENCODE_MULTI_AUTH_NOTIFY_SOUND || '/System/Library/Sounds/Glass.aiff').trim();
+    const lastStatusBySession = new Map();
+    const lastNotifiedAtByKey = new Map();
+    const lastRetryAttemptBySession = new Map();
+    const escapeAppleScriptString = (value) => {
+        return String(value)
+            .replaceAll('\\', '\\\\')
+            .replaceAll('"', '\"')
+            .replaceAll(String.fromCharCode(10), '\n');
+    };
+    let didWarnTerminalNotifier = false;
+    const notifyMac = (title, message, clickUrl) => {
+        if (!notifyEnabled)
+            return;
+        if (process.platform !== 'darwin')
+            return;
+        const macOpenRaw = process.env.OPENCODE_MULTI_AUTH_NOTIFY_MAC_OPEN;
+        const macOpenEnabled = macOpenRaw !== '0' && macOpenRaw !== 'false';
+        if (macOpenEnabled && clickUrl && terminalNotifierPath) {
+            try {
+                $ `${terminalNotifierPath} -title ${title} -message ${message} -open ${clickUrl}`
+                    .nothrow()
+                    .catch(() => { });
+            }
+            catch {
+            }
+        }
+        else {
+            if (macOpenEnabled && clickUrl && !terminalNotifierPath && !didWarnTerminalNotifier) {
+                didWarnTerminalNotifier = true;
+                if (process.env.OPENCODE_MULTI_AUTH_DEBUG === '1') {
+                    console.log('[multi-auth] mac click-to-open requires terminal-notifier (brew install terminal-notifier)');
+                }
+            }
+            try {
+                const osascript = '/usr/bin/osascript';
+                const safeTitle = escapeAppleScriptString(title);
+                const safeMessage = escapeAppleScriptString(message);
+                const script = `display notification "${safeMessage}" with title "${safeTitle}"`;
+                $ `${osascript} -e ${script}`.nothrow().catch(() => { });
+            }
+            catch {
+            }
+        }
+        if (!notifySound)
+            return;
+        try {
+            const afplay = '/usr/bin/afplay';
+            $ `${afplay} ${notifySound}`.nothrow().catch(() => { });
+        }
+        catch {
+        }
+    };
+    const ntfyUrl = (process.env.OPENCODE_MULTI_AUTH_NOTIFY_NTFY_URL || '').trim();
+    const ntfyToken = (process.env.OPENCODE_MULTI_AUTH_NOTIFY_NTFY_TOKEN || '').trim();
+    const notifyUiBaseUrl = (process.env.OPENCODE_MULTI_AUTH_NOTIFY_UI_BASE_URL || '').trim();
+    const getSessionUrl = (sessionID) => {
+        const base = (notifyUiBaseUrl || serverUrl?.origin || '').replace(/\/$/, '');
+        if (!base)
+            return '';
+        return `${base}/session/${sessionID}`;
+    };
+    const projectLabel = (project?.name || project?.id || '').trim() || 'OpenCode';
+    const sessionMetaCache = new Map();
+    const getSessionMeta = async (sessionID) => {
+        const cached = sessionMetaCache.get(sessionID);
+        if (cached?.title)
+            return cached;
+        try {
+            const res = await client.session.get({
+                path: { id: sessionID },
+                query: { directory }
+            });
+            const data = res?.data;
+            const meta = { title: data?.title };
+            sessionMetaCache.set(sessionID, meta);
+            return meta;
+        }
+        catch {
+            const meta = cached || {};
+            sessionMetaCache.set(sessionID, meta);
+            return meta;
+        }
+    };
+    const formatTitle = (kind) => {
+        if (kind === 'error')
+            return `OpenCode - ${projectLabel} - Error`;
+        if (kind === 'retry')
+            return `OpenCode - ${projectLabel} - Retrying`;
+        return `OpenCode - ${projectLabel}`;
+    };
+    const formatBody = async (kind, sessionID, detail) => {
+        const meta = await getSessionMeta(sessionID);
+        const titleLine = meta.title ? `Task: ${meta.title}` : '';
+        const url = getSessionUrl(sessionID);
+        if (kind === 'idle') {
+            return [titleLine, `Session finished: ${sessionID}`, detail || '', url].filter(Boolean).join('\n');
+        }
+        if (kind === 'retry') {
+            return [titleLine, `Retrying: ${sessionID}`, detail || '', url].filter(Boolean).join('\n');
+        }
+        return [titleLine, `Error: ${sessionID}`, detail || '', url].filter(Boolean).join('\n');
+    };
+    const notifyMacRich = async (kind, sessionID, detail) => {
+        const body = await formatBody(kind, sessionID, detail);
+        notifyMac(formatTitle(kind), body, getSessionUrl(sessionID) || undefined);
+    };
+    const notifyNtfyRich = async (kind, sessionID, detail) => {
+        if (!notifyEnabled)
+            return;
+        if (!ntfyUrl)
+            return;
+        const sessionUrl = getSessionUrl(sessionID);
+        const title = formatTitle(kind);
+        const body = await formatBody(kind, sessionID, detail);
+        const priority = kind === 'error' ? '5' : kind === 'retry' ? '4' : '3';
+        const headers = {
+            'Content-Type': 'text/plain; charset=utf-8',
+            'Title': title,
+            'Priority': priority
+        };
+        if (sessionUrl)
+            headers['Click'] = sessionUrl;
+        if (ntfyToken)
+            headers['Authorization'] = `Bearer ${ntfyToken}`;
+        try {
+            await fetch(ntfyUrl, { method: 'POST', headers, body });
+        }
+        catch {
+        }
+    };
+    const shouldThrottle = (key, minMs) => {
+        const last = lastNotifiedAtByKey.get(key) || 0;
+        const now = Date.now();
+        if (now - last < minMs)
+            return true;
+        lastNotifiedAtByKey.set(key, now);
+        return false;
+    };
+    const formatRetryDetail = (status) => {
+        const attempt = typeof status?.attempt === 'number' ? status.attempt : undefined;
+        const message = typeof status?.message === 'string' ? status.message : '';
+        const next = typeof status?.next === 'number' ? status.next : undefined;
+        const parts = [];
+        if (typeof attempt === 'number')
+            parts.push(`Attempt: ${attempt}`);
+        if (typeof next === 'number') {
+            const seconds = next > 1e12 ? Math.max(0, Math.round((next - Date.now()) / 1000)) : Math.max(0, Math.round(next));
+            parts.push(`Next in: ${seconds}s`);
+        }
+        if (message)
+            parts.push(message);
+        return parts.join(' | ');
+    };
+    const formatErrorDetail = (err) => {
+        if (!err || typeof err !== 'object')
+            return '';
+        const name = typeof err.name === 'string' ? err.name : '';
+        const code = typeof err.code === 'string' ? err.code : '';
+        const message = (typeof err.message === 'string' && err.message) ||
+            (typeof err.error?.message === 'string' && err.error.message) ||
+            '';
+        return [name, code, message].filter(Boolean).join(': ');
+    };
+    const notifyRich = async (kind, sessionID, detail) => {
+        try {
+            await notifyMacRich(kind, sessionID, detail);
+        }
+        catch {
+        }
+        try {
+            await notifyNtfyRich(kind, sessionID, detail);
+        }
+        catch {
+        }
+    };
     return {
+        event: async ({ event }) => {
+            if (!notifyEnabled)
+                return;
+            if (!event || !('type' in event))
+                return;
+            if (event.type === 'session.created' || event.type === 'session.updated') {
+                const info = event.properties?.info;
+                const id = info?.id;
+                if (id) {
+                    sessionMetaCache.set(id, { title: info?.title });
+                }
+                return;
+            }
+            if (event.type === 'session.status') {
+                const sessionID = event.properties?.sessionID;
+                const status = event.properties?.status;
+                const statusType = status?.type;
+                if (!sessionID || !statusType)
+                    return;
+                lastStatusBySession.set(sessionID, statusType);
+                if (statusType === 'retry') {
+                    const attempt = typeof status?.attempt === 'number' ? status.attempt : undefined;
+                    const prevAttempt = lastRetryAttemptBySession.get(sessionID);
+                    if (typeof attempt === 'number') {
+                        if (prevAttempt === attempt && shouldThrottle(`retry:${sessionID}:${attempt}`, 5000)) {
+                            return;
+                        }
+                        lastRetryAttemptBySession.set(sessionID, attempt);
+                    }
+                    const key = `retry:${sessionID}:${typeof attempt === 'number' ? attempt : 'na'}`;
+                    if (shouldThrottle(key, 2000))
+                        return;
+                    await notifyRich('retry', sessionID, formatRetryDetail(status));
+                }
+                return;
+            }
+            if (event.type === 'session.error') {
+                const sessionID = event.properties?.sessionID;
+                const id = sessionID || 'unknown';
+                const err = event.properties?.error;
+                const detail = formatErrorDetail(err);
+                const key = `error:${id}:${detail}`;
+                if (shouldThrottle(key, 2000))
+                    return;
+                await notifyRich('error', id, detail);
+                return;
+            }
+            if (event.type === 'session.idle') {
+                const sessionID = event.properties?.sessionID;
+                if (!sessionID)
+                    return;
+                const prev = lastStatusBySession.get(sessionID);
+                if (prev === 'busy' || prev === 'retry') {
+                    if (shouldThrottle(`idle:${sessionID}`, 2000))
+                        return;
+                    await notifyRich('idle', sessionID);
+                }
+                lastStatusBySession.set(sessionID, 'idle');
+            }
+        },
+        config: async (config) => {
+            const injectModelsRaw = process.env.OPENCODE_MULTI_AUTH_INJECT_MODELS;
+            const injectModels = injectModelsRaw !== '0' && injectModelsRaw !== 'false';
+            if (!injectModels)
+                return;
+            const latestModel = (process.env.OPENCODE_MULTI_AUTH_CODEX_LATEST_MODEL || 'gpt-5.4').trim();
+            try {
+                const openai = config.provider?.[PROVIDER_ID] || null;
+                if (!openai || typeof openai !== 'object')
+                    return;
+                openai.models ||= {};
+                openai.whitelist ||= [];
+                const defaultModels = getDefaultModels();
+                const injectedModelIds = [latestModel];
+                if (latestModel === 'gpt-5.4' && defaultModels['gpt-5.4-fast']) {
+                    injectedModelIds.push('gpt-5.4-fast');
+                }
+                for (const modelID of injectedModelIds) {
+                    const model = defaultModels[modelID];
+                    if (!model || openai.models[modelID])
+                        continue;
+                    openai.models[modelID] = model;
+                }
+                for (const modelID of injectedModelIds) {
+                    if (!openai.whitelist.includes(modelID)) {
+                        openai.whitelist.unshift(modelID);
+                    }
+                }
+                if (process.env.OPENCODE_MULTI_AUTH_DEBUG === '1') {
+                    console.log(`[multi-auth] injected runtime models: ${injectedModelIds.join(', ')}`);
+                }
+            }
+            catch (err) {
+                if (process.env.OPENCODE_MULTI_AUTH_DEBUG === '1') {
+                    console.log('[multi-auth] config injection failed:', err);
+                }
+            }
+        },
         auth: {
             provider: PROVIDER_ID,
             async loader(getAuth, provider) {
@@ -199,25 +506,179 @@ const MultiAuthPlugin = async ({ client, $, serverUrl, project, directory }) => 
                     console.log('[multi-auth] No accounts configured. Run: opencode-multi-auth add <alias>');
                     return {};
                 }
-                const customFetch = async (input, init) => new Response('Not included in truncated artifact update');
-                return {
-                    apiKey: 'chatgpt-oauth',
-                    baseURL: CODEX_BASE_URL,
-                    fetch: customFetch
+                const customFetch = async (input, init) => {
+                    await syncAuthFromOpenCode(getAuth);
+                    const store = loadStore();
+                    const forceState = getForceState();
+                    const forcePinned = isForceActive() && !!forceState.forcedAlias;
+                    const eligibleCount = Object.values(store.accounts).filter(acc => {
+                        const now = Date.now();
+                        return (!acc.rateLimitedUntil || acc.rateLimitedUntil < now) && (!acc.modelUnsupportedUntil || acc.modelUnsupportedUntil < now) && (!acc.workspaceDeactivatedUntil || acc.workspaceDeactivatedUntil < now) && !acc.authInvalid && acc.enabled !== false;
+                    }).length;
+                    const maxAttempts = forcePinned ? 1 : Math.max(1, eligibleCount);
+                    const triedAliases = new Set();
+                    let attempt = 0;
+                    while (attempt < maxAttempts) {
+                        attempt++;
+                        const settings = getRuntimeSettings();
+                        const effectiveConfig = {
+                            ...pluginConfig,
+                            rotationStrategy: settings.settings.rotationStrategy
+                        };
+                        const rotation = await getNextAccount(effectiveConfig);
+                        if (!rotation) {
+                            if (forcePinned && forceState.forcedAlias) {
+                                const forced = loadStore().accounts[forceState.forcedAlias];
+                                const now = Date.now();
+                                if (forced?.rateLimitedUntil && forced.rateLimitedUntil > now) {
+                                    return new Response(JSON.stringify({ error: { code: 'RATE_LIMITED', message: `Forced account '${forced.alias}' is rate-limited until ${new Date(forced.rateLimitedUntil).toISOString()}`, details: { alias: forced.alias, rateLimitedUntil: forced.rateLimitedUntil } } }), { status: 429, headers: { 'Content-Type': 'application/json' } });
+                                }
+                            }
+                            return new Response(JSON.stringify({ error: Errors.noEligibleAccounts('No available accounts after filtering') }), { status: 503, headers: { 'Content-Type': 'application/json' } });
+                        }
+                        const { account, token } = rotation;
+                        if (triedAliases.has(account.alias)) {
+                            continue;
+                        }
+                        triedAliases.add(account.alias);
+                        const decoded = decodeJWT(token);
+                        const accountId = decoded?.[JWT_CLAIM_PATH]?.chatgpt_account_id;
+                        if (!accountId) {
+                            return new Response(JSON.stringify({ error: { code: 'TOKEN_PARSE_ERROR', message: '[multi-auth] Failed to extract accountId from token' } }), { status: 401, headers: { 'Content-Type': 'application/json' } });
+                        }
+                        const originalUrl = extractRequestUrl(input);
+                        const url = toCodexBackendUrl(originalUrl);
+                        let body = {};
+                        try {
+                            body = init?.body ? JSON.parse(init.body) : {};
+                        }
+                        catch {
+                            body = {};
+                        }
+                        const isStreaming = body?.stream === true;
+                        const normalizedModel = normalizeModel(body.model);
+                        const fastMode = /-fast$/.test(body.model || '');
+                        const supportedFastMode = fastMode && normalizedModel === 'gpt-5.4';
+                        const reasoningMatch = body.model?.match(/-(none|low|medium|high|xhigh)$/);
+                        const payload = { ...body, model: normalizedModel, store: false };
+                        if (payload.truncation === undefined) {
+                            const truncationRaw = (process.env.OPENCODE_MULTI_AUTH_TRUNCATION || '').trim();
+                            if (truncationRaw && truncationRaw !== 'disabled' && truncationRaw !== 'false' && truncationRaw !== '0') {
+                                payload.truncation = truncationRaw;
+                            }
+                        }
+                        if (payload.input) {
+                            payload.input = filterInput(payload.input);
+                        }
+                        if (reasoningMatch?.[1]) {
+                            payload.reasoning = { ...(payload.reasoning || {}), effort: reasoningMatch[1], summary: payload.reasoning?.summary || 'auto' };
+                        }
+                        if (supportedFastMode) {
+                            payload.service_tier = payload.service_tier || 'priority';
+                            if (process.env.OPENCODE_MULTI_AUTH_DEBUG === '1') {
+                                console.log('[multi-auth] fast mode enabled: gpt-5.4 + service_tier=priority');
+                            }
+                        }
+                        else if (fastMode && process.env.OPENCODE_MULTI_AUTH_DEBUG === '1') {
+                            console.log(`[multi-auth] fast mode ignored for unsupported model: ${normalizedModel}`);
+                        }
+                        if (process.env.OPENCODE_MULTI_AUTH_DEBUG === '1' && payload.service_tier === 'priority') {
+                            console.log(`[multi-auth] priority service tier requested for ${normalizedModel}`);
+                        }
+                        delete payload.reasoning_effort;
+                        try {
+                            const headers = new Headers(init?.headers || {});
+                            headers.delete('x-api-key');
+                            headers.set('Content-Type', 'application/json');
+                            headers.set('Authorization', `Bearer ${token}`);
+                            headers.set(OPENAI_HEADERS.ACCOUNT_ID, accountId);
+                            headers.set(OPENAI_HEADERS.BETA, OPENAI_HEADER_VALUES.BETA_RESPONSES);
+                            headers.set(OPENAI_HEADERS.ORIGINATOR, OPENAI_HEADER_VALUES.ORIGINATOR_CODEX);
+                            const cacheKey = payload?.prompt_cache_key;
+                            if (cacheKey) {
+                                headers.set(OPENAI_HEADERS.CONVERSATION_ID, cacheKey);
+                                headers.set(OPENAI_HEADERS.SESSION_ID, cacheKey);
+                            }
+                            else {
+                                headers.delete(OPENAI_HEADERS.CONVERSATION_ID);
+                                headers.delete(OPENAI_HEADERS.SESSION_ID);
+                            }
+                            headers.set('accept', 'text/event-stream');
+                            const res = await fetch(url, { method: init?.method || 'POST', headers, body: JSON.stringify(payload) });
+                            const limitUpdate = extractRateLimitUpdate(res.headers);
+                            const mergedRateLimits = limitUpdate ? mergeRateLimits(account.rateLimits, limitUpdate) : account.rateLimits;
+                            if (limitUpdate) {
+                                updateAccount(account.alias, { rateLimits: mergedRateLimits });
+                            }
+                            if (res.status === 401 || res.status === 403) {
+                                const errorData = await res.clone().json().catch(() => ({}));
+                                const message = errorData?.error?.message || '';
+                                if (message.toLowerCase().includes('invalidated') || res.status === 401) {
+                                    markAuthInvalid(account.alias);
+                                }
+                                if (attempt < maxAttempts) {
+                                    continue;
+                                }
+                                return new Response(JSON.stringify({ error: Errors.maxRetriesExceeded(attempt, Array.from(triedAliases)) }), { status: res.status, headers: { 'Content-Type': 'application/json' } });
+                            }
+                            if (res.status === 429) {
+                                const errorData = await res.clone().json().catch(() => ({}));
+                                const errorText = extractErrorMessage(errorData);
+                                const rateLimitedUntil = resolveRateLimitedUntil(mergedRateLimits, res.headers, errorText, pluginConfig.rateLimitCooldownMs);
+                                markRateLimited(account.alias, rateLimitedUntil);
+                                if (attempt < maxAttempts) {
+                                    continue;
+                                }
+                                return new Response(JSON.stringify({ error: Errors.maxRetriesExceeded(attempt, Array.from(triedAliases)) }), { status: 429, headers: { 'Content-Type': 'application/json' } });
+                            }
+                            if (res.status === 402) {
+                                const errorData = await res.clone().json().catch(() => null);
+                                const errorText = await res.clone().text().catch(() => '');
+                                const code = (typeof errorData?.detail?.code === 'string' && errorData.detail.code) || (typeof errorData?.error?.code === 'string' && errorData.error.code) || '';
+                                const message = (typeof errorData?.detail?.message === 'string' && errorData.detail.message) || (typeof errorData?.detail === 'string' && errorData.detail) || (typeof errorData?.error?.message === 'string' && errorData.error.message) || (typeof errorData?.message === 'string' && errorData.message) || errorText || '';
+                                const isDeactivatedWorkspace = code === 'deactivated_workspace' || message.toLowerCase().includes('deactivated_workspace') || message.toLowerCase().includes('deactivated workspace');
+                                if (isDeactivatedWorkspace) {
+                                    markWorkspaceDeactivated(account.alias, pluginConfig.workspaceDeactivatedCooldownMs, { error: message || code });
+                                    if (attempt < maxAttempts) {
+                                        continue;
+                                    }
+                                    return new Response(JSON.stringify({ error: Errors.maxRetriesExceeded(attempt, Array.from(triedAliases)) }), { status: 402, headers: { 'Content-Type': 'application/json' } });
+                                }
+                            }
+                            if (res.status === 400) {
+                                const errorData = await res.clone().json().catch(() => ({}));
+                                const message = (typeof errorData?.detail === 'string' && errorData.detail) || (typeof errorData?.error?.message === 'string' && errorData.error.message) || (typeof errorData?.message === 'string' && errorData.message) || '';
+                                const isModelUnsupported = typeof message === 'string' && message.toLowerCase().includes('model is not supported') && message.toLowerCase().includes('chatgpt account');
+                                if (isModelUnsupported) {
+                                    markModelUnsupported(account.alias, pluginConfig.modelUnsupportedCooldownMs, { model: normalizedModel, error: message });
+                                    if (attempt < maxAttempts) {
+                                        continue;
+                                    }
+                                    return new Response(JSON.stringify({ error: Errors.maxRetriesExceeded(attempt, Array.from(triedAliases)) }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+                                }
+                            }
+                            if (!res.ok) {
+                                return res;
+                            }
+                            const responseHeaders = ensureContentType(res.headers);
+                            if (!isStreaming && responseHeaders.get('content-type')?.includes('text/event-stream')) {
+                                return await convertSseToJson(res, responseHeaders);
+                            }
+                            return res;
+                        }
+                        catch (err) {
+                            return new Response(JSON.stringify({ error: { code: 'REQUEST_FAILED', message: `[multi-auth] Request failed: ${err}` } }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+                        }
+                    }
+                    return new Response(JSON.stringify({ error: Errors.maxRetriesExceeded(attempt, Array.from(triedAliases)) }), { status: 503, headers: { 'Content-Type': 'application/json' } });
                 };
+                return { apiKey: 'chatgpt-oauth', baseURL: CODEX_BASE_URL, fetch: customFetch };
             },
             methods: [
                 {
                     label: 'ChatGPT OAuth (Multi-Account)',
                     type: 'oauth',
-                    prompts: [
-                        {
-                            type: 'text',
-                            key: 'alias',
-                            message: 'Account alias (e.g., personal, work)',
-                            placeholder: 'personal'
-                        }
-                    ],
+                    prompts: [{ type: 'text', key: 'alias', message: 'Account alias (e.g., personal, work)', placeholder: 'personal' }],
                     authorize: async (inputs) => {
                         const alias = inputs?.alias || `account-${Date.now()}`;
                         const flow = await createAuthorizationFlow();
@@ -228,50 +689,7 @@ const MultiAuthPlugin = async ({ client, $, serverUrl, project, directory }) => 
                             callback: async () => {
                                 try {
                                     const account = await loginAccount(alias, flow);
-                                    return {
-                                        type: 'success',
-                                        provider: PROVIDER_ID,
-                                        refresh: account.refreshToken,
-                                        access: account.accessToken,
-                                        expires: account.expiresAt
-                                    };
-                                }
-                                catch {
-                                    return { type: 'failed' };
-                                }
-                            }
-                        };
-                    }
-                },
-                {
-                    label: 'ChatGPT OAuth (Manual Callback)',
-                    type: 'oauth',
-                    prompts: [
-                        {
-                            type: 'text',
-                            key: 'alias',
-                            message: 'Account alias (e.g., personal, work)',
-                            placeholder: 'personal'
-                        }
-                    ],
-                    authorize: async (inputs) => {
-                        const alias = inputs?.alias || `account-${Date.now()}`;
-                        const flow = await createAuthorizationFlow();
-                        return {
-                            url: flow.url,
-                            method: 'auto',
-                            instructions: `If this OpenCode session is remote, complete login in your browser, then paste the full callback URL back into the terminal prompt for "${alias}".`,
-                            callback: async () => {
-                                try {
-                                    const callbackUrl = await promptForCallbackUrl(alias, flow);
-                                    const account = await completeAuthorizationFlow(alias, flow, callbackUrl);
-                                    return {
-                                        type: 'success',
-                                        provider: PROVIDER_ID,
-                                        refresh: account.refreshToken,
-                                        access: account.accessToken,
-                                        expires: account.expiresAt
-                                    };
+                                    return { type: 'success', provider: PROVIDER_ID, refresh: account.refreshToken, access: account.accessToken, expires: account.expiresAt };
                                 }
                                 catch {
                                     return { type: 'failed' };
