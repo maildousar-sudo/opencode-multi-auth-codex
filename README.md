@@ -141,6 +141,9 @@ npm run build
 opencode-multi-auth add personal
 opencode-multi-auth add work
 
+# For remote Docker/VPS sessions, use manual callback mode
+opencode-multi-auth add remote --headless
+
 # Check status
 opencode-multi-auth status
 
@@ -149,6 +152,32 @@ opencode-multi-auth web --host 127.0.0.1 --port 3434
 ```
 
 Open `http://127.0.0.1:3434`.
+
+### Remote Docker / VPS login
+
+If OpenCode or this plugin runs inside a remote container or VM, the standard localhost callback flow can fail because the browser redirects to `http://localhost:1455/...` on your local machine instead of the remote runtime.
+
+Use the manual callback flow instead:
+
+```bash
+opencode-multi-auth add remote --headless
+```
+
+Flow:
+
+1. The CLI prints the OpenAI authorization URL.
+2. Open it in your browser and finish the login.
+3. When OpenAI redirects to `http://localhost:1455/auth/callback?...`, the page may fail to load locally.
+4. Copy the full URL from the browser address bar.
+5. Paste it back into the CLI prompt.
+
+You can also complete the flow later with:
+
+```bash
+opencode-multi-auth complete remote 'http://localhost:1455/auth/callback?code=...&state=...'
+```
+
+Inside OpenCode, the provider picker also exposes `ChatGPT OAuth (Manual Callback)` for the same use case.
 
 ## Automated Bulk Login (Outlook)
 
@@ -260,6 +289,8 @@ Outlook login often shows interstitial pages after password entry:
 ## CLI commands
 
 - `opencode-multi-auth add <alias>` -> add account via OAuth
+- `opencode-multi-auth add <alias> --headless` -> add account via manual callback completion
+- `opencode-multi-auth complete <alias> <callback_url>` -> finish a manual callback login with the pasted redirect URL
 - `opencode-multi-auth remove <alias>` -> remove account
 - `opencode-multi-auth list` -> list configured accounts
 - `opencode-multi-auth status` -> full status
